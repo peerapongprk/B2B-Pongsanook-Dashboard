@@ -49,3 +49,25 @@ ALTER TABLE upload_log           ENABLE ROW LEVEL SECURITY;
 CREATE POLICY "allow_all_datasets"            ON datasets            FOR ALL USING (true) WITH CHECK (true);
 CREATE POLICY "allow_all_visit_override"      ON visit_plan_override FOR ALL USING (true) WITH CHECK (true);
 CREATE POLICY "allow_all_upload_log"          ON upload_log          FOR ALL USING (true) WITH CHECK (true);
+
+-- 5. Users (salespeople)
+CREATE TABLE IF NOT EXISTS users (
+    id         SERIAL PRIMARY KEY,
+    name       TEXT NOT NULL UNIQUE,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 6. User → Customer portfolio mapping
+CREATE TABLE IF NOT EXISTS user_customers (
+    id            SERIAL PRIMARY KEY,
+    user_id       INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    customer_num  TEXT NOT NULL,
+    customer_name TEXT,
+    added_at      TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(user_id, customer_num)
+);
+
+ALTER TABLE users           ENABLE ROW LEVEL SECURITY;
+ALTER TABLE user_customers  ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "allow_all_users"          ON users          FOR ALL USING (true) WITH CHECK (true);
+CREATE POLICY "allow_all_user_customers" ON user_customers FOR ALL USING (true) WITH CHECK (true);

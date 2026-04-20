@@ -200,3 +200,85 @@ def log_upload(filename: str, row_count: int) -> None:
     conn = _sqlite_connect()
     conn.execute("INSERT INTO upload_log (filename,row_count) VALUES (?,?)", (filename, row_count))
     conn.commit(); conn.close()
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  USER & PORTFOLIO MANAGEMENT
+# ══════════════════════════════════════════════════════════════════════════════
+def _ensure_user_tables_sqlite():
+    conn = _sqlite_connect(); cur = conn.cursor()
+    cur.execute("""CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL UNIQUE,
+        created_at TEXT DEFAULT (datetime('now')))""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS user_customers (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        customer_num TEXT NOT NULL,
+        customer_name TEXT,
+        added_at TEXT DEFAULT (datetime('now')),
+        UNIQUE(user_id, customer_num))""")
+    conn.commit(); conn.close()
+
+def list_users() -> list[dict]:
+    if _use_supabase():
+        r = _sb().table("users").select("*").order("name").execute()
+        return r.data or []
+    _ensure_user_tables_sqlite()
+    conn = _sqlite_connect()
+    rows = conn.execute("SELECT * FROM users ORDER BY name").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+def save_user(name: str) -> int:
+    if _use_supabase():
+        r = _sb().table("users").insert({"name": name}).execute()
+        return r.data[0]["id"]
+    _ensure_user_tables_sqlite()
+    conn = _sqlite_connect(); cur = conn.cursor()
+    cur.execute("INSERT OR IGNORE INTO users (name) VALUES (?)", (name,))
+    conn.commit()
+    uid = conn.execute("SELECT id FROM users WHERE name=?", (name,)).fetchone()["id"]
+    conn.close(); return uid
+
+def delete_user(user_id: int) -> None:
+    if _use_supabase():
+        _sb().table("user_customers").delete().eq("user_id", user_id).execute()
+        _sb().table("users").delete().eq("id", user_id).execute()
+        return
+    _ensure_user_tables_sqlite()
+    conn = _sqlite_connect()
+    conn.execute("DELETE FROM user_customers WHERE user_id=?", (user_id,))
+    conn.execute("DELETE FROM users WHERE id=?", (user_id,))
+    conn.commit(); conn.close()
+
+def get_user_customers(user_id: int) -> list[str]:
+    """Return list of customer_num strings for a user."""
+    if _use_supabase():
+        r = (_sb().table("user_customers")
+               .select("customer_num")
+               .eq("user_id", user_id)
+               .execute())
+        return [row["customer_num"] for row in (r.data or [])]
+    _ensure_user_tables_sqlite()
+    conn = _sqlite_connect()
+    rows = conn.execute("SELECT customer_num FROM user_customers WHERE user_id=?", (user_id,)).fetchall()
+    conn.close()
+    return [r["customer_num"] for r in rows]
+
+def set_user_customers(user_id: int, customer_nums: list[str], customer_names: dict[str,str] | None = None) -> None:
+    """Replace all customers for a user."""
+    names = customer_names or {}
+    if _use_supabase():
+        sb = _sb()
+        sb.table("user_customers").delete().eq("user_id", user_id).execute()
+        if customer_nums:
+            rows = [{"user_id": user_id, "customer_num": c, "customer_name": names.get(c,"")} for c in customer_nums]
+            sb.table("user_customers").insert(rows).execute()
+        return
+    _ensure_user_tables_sqlite()
+    conn = _sqlite_connect(); cur = conn.cursor()
+    cur.execute("DELETE FROM user_customers WHERE user_id=?", (user_id,))
+    for c in customer_nums:
+        cur.execute("INSERT OR IGNORE INTO user_customers (user_id, customer_num, customer_name) VALUES (?,?,?)",
+                    (user_id, c, names.get(c,"")))
+    conn.commit(); conn.close()
