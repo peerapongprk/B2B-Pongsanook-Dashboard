@@ -11,7 +11,12 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-from database.persistence  import init_db, save_manual_visits, load_manual_visits, log_upload
+from database.persistence  import (
+    init_db, save_manual_visits, load_manual_visits, log_upload,
+    save_dataset, list_datasets, load_dataset,
+    set_active_dataset, get_active_dataset_id,
+    delete_dataset, rename_dataset,
+)
 from database.schema       import MAKRO as S
 from utils.data_engine     import (
     load_raw_file, clean_data, compute_kpis,
@@ -42,17 +47,28 @@ init_db()
 
 # ── Session state ─────────────────────────────────────────────────────────────
 _DEFAULTS = {
-    "df":           None,
-    "visit_plan":   None,
+    "df":            None,
+    "active_ds_id":  None,   # active dataset id from DB
+    "visit_plan":    None,
     "region_filter": "ทั้งหมด",
     "segment_filter": "ทั้งหมด",
-    "micro_cust":   None,
-    "cal_month":    date.today().replace(day=1),
-    "division":     "Makro",
+    "micro_cust":    None,
+    "cal_month":     date.today().replace(day=1),
+    "division":      "Makro",
 }
 for k, v in _DEFAULTS.items():
     if k not in st.session_state:
         st.session_state[k] = v
+
+# Auto-load active dataset from DB on first run
+if st.session_state.df is None:
+    active_id = get_active_dataset_id()
+    if active_id:
+        try:
+            st.session_state.df = load_dataset(active_id)
+            st.session_state.active_ds_id = active_id
+        except Exception:
+            pass
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 def render_sidebar():
@@ -88,18 +104,37 @@ def _sidebar_makro():
         with st.spinner("กำลังประมวลผล…"):
             raw = load_raw_file(uploaded)
             df, warns = clean_data(raw)
-            st.session_state.df         = df
-            st.session_state.visit_plan = None   # reset plan on new upload
-            st.session_state.micro_cust = None
+            # Save to persistent DB
+            label  = uploaded.name.rsplit(".", 1)[0]
+            ds_id  = save_dataset(label, uploaded.name, df)
+            set_active_dataset(ds_id)
+            st.session_state.df           = df
+            st.session_state.active_ds_id = ds_id
+            st.session_state.visit_plan   = None
+            st.session_state.micro_cust   = None
             log_upload(uploaded.name, len(df))
             for w in warns:
                 st.warning(w)
             if not warns:
-                st.success(f"✅ โหลดสำเร็จ {len(df):,} แถว")
+                st.success(f"✅ โหลดสำเร็จ {len(df):,} แถว — บันทึกแล้ว")
 
     if st.session_state.df is not None:
         st.divider()
         df = st.session_state.df
+
+        # Active dataset badge
+        datasets = list_datasets()
+        active   = next((d for d in datasets if d["is_active"]), None)
+        if active:
+            st.markdown(
+                f'<div style="background:#ECFDF5;border-radius:8px;padding:.5rem .75rem;'
+                f'font-size:.75rem;color:#065F46;margin-bottom:.5rem">'
+                f'📦 <b>{active["label"]}</b><br>'
+                f'<span style="color:#6B7280">{active["row_count"]:,} แถว</span></div>',
+                unsafe_allow_html=True
+            )
+        if len(datasets) > 1:
+            st.caption(f"มีข้อมูลทั้งหมด {len(datasets)} ชุด → ดูที่แท็บ 🗄️")
 
         # Filters
         st.markdown("**🔍 กรองข้อมูล**")
@@ -153,10 +188,11 @@ if st.session_state.segment_filter != "ทั้งหมด" and S.CUST_GROUP i
     df = df[df[S.CUST_GROUP] == st.session_state.segment_filter]
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab_overview, tab_micro, tab_calendar = st.tabs([
+tab_overview, tab_micro, tab_calendar, tab_data = st.tabs([
     "📊 ภาพรวม (Macro)",
     "🔍 รายลูกค้า (Micro)",
     "📅 แผนการเยี่ยม",
+    "🗄️ ฐานข้อมูล",
 ])
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -543,3 +579,118 @@ with tab_calendar:
             file_name="visit_plan.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  TAB 4 — DATA MANAGER (ฐานข้อมูลกลาง)
+# ═══════════════════════════════════════════════════════════════════════════════
+with tab_data:
+    st.markdown(section_header("ฐานข้อมูลกลาง", "🗄️"), unsafe_allow_html=True)
+
+    # ── Upload new dataset ────────────────────────────────────────────────────
+    with st.expander("➕ เพิ่มชุดข้อมูลใหม่", expanded=(len(list_datasets()) == 0)):
+        up_col1, up_col2 = st.columns([3, 1])
+        with up_col1:
+            new_label = st.text_input("ชื่อชุดข้อมูล",
+                                      placeholder="เช่น ข้อมูล Q2 2026, Makro รายเดือน มี.ค.")
+        with up_col2:
+            st.markdown("<div style='height:1.7rem'></div>", unsafe_allow_html=True)
+
+        new_file = st.file_uploader(
+            "ไฟล์ Excel (.xlsx / .xls) หรือ CSV",
+            type=["xlsx", "xls", "csv"],
+            label_visibility="collapsed",
+            key="db_uploader",
+        )
+        if new_file:
+            auto_label = new_label.strip() or new_file.name.rsplit(".", 1)[0]
+            if st.button("💾 บันทึกเข้าฐานข้อมูล", type="primary", use_container_width=True):
+                with st.spinner("กำลังประมวลผลและบันทึก…"):
+                    raw = load_raw_file(new_file)
+                    df_new, warns = clean_data(raw)
+                    ds_id = save_dataset(auto_label, new_file.name, df_new)
+                    for w in warns:
+                        st.warning(w)
+                    st.success(f"✅ บันทึก **{auto_label}** สำเร็จ — {len(df_new):,} แถว")
+                    st.rerun()
+
+    st.markdown("<div style='height:.5rem'></div>", unsafe_allow_html=True)
+
+    # ── Dataset list ──────────────────────────────────────────────────────────
+    datasets = list_datasets()
+
+    if not datasets:
+        st.info("ยังไม่มีชุดข้อมูล — อัปโหลดไฟล์ด้านบนเพื่อเริ่มต้น")
+    else:
+        active_id = get_active_dataset_id()
+        st.markdown(f"**{len(datasets)} ชุดข้อมูล** ในระบบ", )
+
+        for ds in datasets:
+            is_active = ds["id"] == active_id
+            border    = "2px solid #1A56DB" if is_active else "1px solid #E2E8F0"
+            bg        = "#F0F7FF" if is_active else "#FFFFFF"
+
+            st.markdown(
+                f'<div style="background:{bg};border:{border};border-radius:12px;'
+                f'padding:.9rem 1.1rem;margin-bottom:.5rem">',
+                unsafe_allow_html=True
+            )
+
+            row_left, row_right = st.columns([5, 3])
+            with row_left:
+                active_badge = " 🟢 **ใช้งานอยู่**" if is_active else ""
+                st.markdown(f"**{ds['label']}**{active_badge}")
+                date_range = f"{ds['date_min']} → {ds['date_max']}" if ds['date_min'] else "ไม่ระบุช่วงวันที่"
+                st.caption(f"📁 {ds['filename']}  |  🔢 {ds['row_count']:,} แถว  |  📅 {date_range}  |  ⏱ {ds['uploaded_at'][:16]}")
+
+            with row_right:
+                btn_c1, btn_c2, btn_c3 = st.columns(3)
+                with btn_c1:
+                    if not is_active:
+                        if st.button("✅ ใช้งาน", key=f"activate_{ds['id']}", use_container_width=True):
+                            with st.spinner("กำลังโหลด…"):
+                                set_active_dataset(ds["id"])
+                                st.session_state.df           = load_dataset(ds["id"])
+                                st.session_state.active_ds_id = ds["id"]
+                                st.session_state.visit_plan   = None
+                                st.session_state.micro_cust   = None
+                                st.session_state.region_filter  = "ทั้งหมด"
+                                st.session_state.segment_filter = "ทั้งหมด"
+                            st.rerun()
+                    else:
+                        st.markdown('<div style="text-align:center;font-size:.8rem;color:#1A56DB;padding-top:.4rem">✅ Active</div>', unsafe_allow_html=True)
+
+                with btn_c2:
+                    # Rename inline
+                    with st.popover("✏️", ):
+                        new_name = st.text_input("ชื่อใหม่", value=ds["label"], key=f"rename_input_{ds['id']}")
+                        if st.button("บันทึก", key=f"rename_save_{ds['id']}"):
+                            rename_dataset(ds["id"], new_name)
+                            st.rerun()
+
+                with btn_c3:
+                    if not is_active:
+                        with st.popover("🗑️"):
+                            st.markdown(f"ลบ **{ds['label']}** ?")
+                            if st.button("ยืนยันลบ", key=f"del_{ds['id']}", type="primary"):
+                                delete_dataset(ds["id"])
+                                st.rerun()
+                    else:
+                        st.markdown('<div style="text-align:center;font-size:.8rem;color:#9CA3AF;padding-top:.4rem">—</div>', unsafe_allow_html=True)
+
+            st.markdown('</div>', unsafe_allow_html=True)
+
+        # ── Summary stats ──────────────────────────────────────────────────────
+        st.markdown("<br>", unsafe_allow_html=True)
+        st.markdown(section_header("สรุปข้อมูล Active Dataset", "📊"), unsafe_allow_html=True)
+        if st.session_state.df is not None:
+            adf = st.session_state.df
+            sc1, sc2, sc3, sc4 = st.columns(4)
+            with sc1: st.markdown(kpi_card("แถวข้อมูล", f"{len(adf):,}", "🔢"), unsafe_allow_html=True)
+            with sc2: st.markdown(kpi_card("จำนวนลูกค้า", f"{adf['Customer Number'].nunique() if 'Customer Number' in adf.columns else '–':,}", "🏪"), unsafe_allow_html=True)
+            with sc3: st.markdown(kpi_card("สินค้า (SKU)", f"{adf['Item'].nunique() if 'Item' in adf.columns else '–':,}", "📦"), unsafe_allow_html=True)
+            with sc4: st.markdown(kpi_card("คอลัมน์", f"{len(adf.columns)}", "📋"), unsafe_allow_html=True)
+
+            st.markdown('<div class="chart-card">', unsafe_allow_html=True)
+            st.markdown("**ตัวอย่างข้อมูล (5 แถวแรก)**")
+            st.dataframe(adf.head(5), use_container_width=True)
+            st.markdown('</div>', unsafe_allow_html=True)
