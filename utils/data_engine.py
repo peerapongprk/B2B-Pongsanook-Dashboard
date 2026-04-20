@@ -262,3 +262,92 @@ def generate_visit_plan(df: pd.DataFrame, horizon_days: int = 30) -> pd.DataFram
     plan = pd.DataFrame(records)
     plan["Visit_Date"] = pd.to_datetime(plan["Visit_Date"])
     return plan.sort_values("Visit_Date").reset_index(drop=True)
+
+# ── Product recommendations (collaborative filtering) ─────────────────────────
+def recommend_items(df: pd.DataFrame, cust_num, n: int = 8) -> list[dict]:
+    """
+    Collaborative filtering:
+    1. หาลูกค้าที่มี purchase overlap กับ target ≥ 2 รายการ
+    2. สินค้าที่ลูกค้าคล้ายกันซื้อ แต่ target ยังไม่ซื้อ = recommendation
+    Returns list of {item, score, market_revenue}
+    """
+    cust_col = S.CUST_NUM if S.CUST_NUM in df.columns else S.CUSTOMER
+    target_mask  = df[cust_col] == cust_num
+    target_items = set(df[target_mask][S.ITEM].unique())
+    if not target_items:
+        return []
+
+    similar: list[tuple] = []
+    for other, odf in df[~target_mask].groupby(cust_col):
+        other_items = set(odf[S.ITEM].unique())
+        overlap = len(target_items & other_items)
+        if overlap >= 2:
+            similar.append((overlap, other_items))
+
+    if not similar:
+        return []
+
+    similar.sort(key=lambda x: -x[0])
+    item_scores: dict = {}
+    for overlap_score, other_items in similar[:20]:
+        for item in (other_items - target_items):
+            item_scores[item] = item_scores.get(item, 0) + overlap_score
+
+    top = sorted(item_scores.items(), key=lambda x: -x[1])[:n]
+    results = []
+    for item, score in top:
+        mkt_rev = df[df[S.ITEM] == item][S.REVENUE].sum()
+        results.append({"item": item, "score": score, "market_revenue": mkt_rev})
+    return results
+
+
+# ── Visit Plan with daily/weekly constraints ──────────────────────────────────
+def generate_visit_plan_constrained(
+    df: pd.DataFrame,
+    horizon_days: int = 30,
+    visits_per_week: int = 20,
+    visits_per_day: int  = 5,
+) -> pd.DataFrame:
+    """
+    Generate visit plan respecting capacity constraints.
+    Priority: High → Medium → Low → Cadence
+    Slides visits forward day-by-day until a slot opens.
+    """
+    raw = generate_visit_plan(df, horizon_days)
+    if raw.empty:
+        return raw
+
+    today   = pd.Timestamp(date.today())
+    horizon = today + pd.Timedelta(days=horizon_days)
+
+    pri_order = {"High": 0, "Medium": 1, "Low": 2, "Cadence": 3}
+    raw["_p"] = raw["Priority"].map(pri_order).fillna(4)
+    raw = raw.sort_values(["_p", "Visit_Date"]).drop(columns=["_p"]).reset_index(drop=True)
+
+    day_used:  dict = {}   # date → count
+    week_used: dict = {}   # "YYYY-WW" → count
+    assigned:  list = []
+
+    for _, row in raw.iterrows():
+        placed = False
+        for offset in range(horizon_days + 7):
+            candidate = row["Visit_Date"] + pd.Timedelta(days=offset)
+            if candidate > horizon:
+                break
+            wk = candidate.strftime("%Y-%W")
+            if (day_used.get(candidate, 0) < visits_per_day and
+                    week_used.get(wk, 0) < visits_per_week):
+                r = row.copy()
+                r["Visit_Date"] = candidate
+                assigned.append(r)
+                day_used[candidate]  = day_used.get(candidate, 0) + 1
+                week_used[wk]        = week_used.get(wk, 0) + 1
+                placed = True
+                break
+        # If no slot found within horizon, skip
+
+    if not assigned:
+        return pd.DataFrame()
+    result = pd.DataFrame(assigned)
+    result["Visit_Date"] = pd.to_datetime(result["Visit_Date"])
+    return result.sort_values("Visit_Date").reset_index(drop=True)
