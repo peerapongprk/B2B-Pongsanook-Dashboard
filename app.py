@@ -110,6 +110,14 @@ def _sidebar_makro():
             segs = ["ทั้งหมด"] + sorted(df[S.CUST_GROUP].dropna().unique().tolist())
             st.session_state.segment_filter = st.selectbox("Segment", segs)
 
+        # ── Reset filters button ───────────────────────────────────────────
+        if (st.session_state.region_filter != "ทั้งหมด" or
+                st.session_state.segment_filter != "ทั้งหมด"):
+            if st.button("🔄 รีเซ็ตตัวกรอง", use_container_width=True, type="secondary"):
+                st.session_state.region_filter  = "ทั้งหมด"
+                st.session_state.segment_filter = "ทั้งหมด"
+                st.rerun()
+
         st.divider()
         st.markdown(f'<div style="font-size:.72rem;color:#64748B">📅 ข้อมูล: {df[S.DATE].min().strftime("%d %b %Y")} – {df[S.DATE].max().strftime("%d %b %Y")}</div>', unsafe_allow_html=True)
         st.markdown(f'<div style="font-size:.72rem;color:#64748B">🔢 {len(df):,} รายการ | {df[S.CUST_NUM].nunique() if S.CUST_NUM in df.columns else "–"} ลูกค้า</div>', unsafe_allow_html=True)
