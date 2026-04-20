@@ -6,8 +6,17 @@ GLOBAL_CSS = """
 
 html, body, [class*="css"] { font-family: 'Sarabun', 'DM Sans', sans-serif !important; }
 
-/* ── Hide Streamlit chrome ── */
-#MainMenu, footer, header { visibility: hidden; }
+/* ── Hide Streamlit chrome (ซ่อนเฉพาะที่ไม่ต้องการ) ── */
+#MainMenu, footer { visibility: hidden; }
+header { visibility: hidden; }
+/* คืนปุ่ม sidebar toggle ให้มองเห็นและกดได้เสมอ */
+[data-testid="collapsedControl"],
+button[data-testid="baseButton-header"],
+section[data-testid="stSidebar"] + div button {
+  visibility: visible !important;
+  pointer-events: auto !important;
+  opacity: 1 !important;
+}
 .block-container { padding: 1.5rem 2rem 3rem !important; max-width: 1400px !important; }
 [data-testid="stSidebar"] > div:first-child { padding-top: 1rem; }
 
