@@ -351,3 +351,173 @@ def generate_visit_plan_constrained(
     result = pd.DataFrame(assigned)
     result["Visit_Date"] = pd.to_datetime(result["Visit_Date"])
     return result.sort_values("Visit_Date").reset_index(drop=True)
+
+# ── Potential Customer Scoring ────────────────────────────────────────────────
+def identify_potential_customers(df: pd.DataFrame, n: int = 200) -> pd.DataFrame:
+    """
+    Score every customer on 3 signals:
+      1. Revenue growth   : recent 30d vs previous 30d (%)
+      2. Frequency growth : purchases/week recent vs historical
+      3. Dept breadth     : unique depts in recent 30d vs prior
+    Composite score → top-n returned, sorted descending.
+    Low-base high-growth customers get a bonus multiplier.
+    """
+    today   = df[S.DATE].max()
+    cut30   = today - pd.Timedelta(days=30)
+    cut60   = today - pd.Timedelta(days=60)
+    cust_col = S.CUST_NUM if S.CUST_NUM in df.columns else S.CUSTOMER
+
+    records = []
+    for cust_id, cdf in df.groupby(cust_col):
+        cust_name  = cdf[S.CUSTOMER].iloc[0]
+        region     = cdf[S.REGION].iloc[0] if S.REGION in cdf.columns else ""
+        segment    = cdf[S.CUST_GROUP].iloc[0] if S.CUST_GROUP in cdf.columns else ""
+
+        recent = cdf[cdf[S.DATE] >= cut30]
+        prior  = cdf[(cdf[S.DATE] >= cut60) & (cdf[S.DATE] < cut30)]
+
+        rev_recent = recent[S.REVENUE].sum()
+        rev_prior  = prior[S.REVENUE].sum()
+        rev_total  = cdf[S.REVENUE].sum()
+
+        # Revenue growth %
+        if rev_prior > 0:
+            rev_growth = (rev_recent - rev_prior) / rev_prior * 100
+        elif rev_recent > 0:
+            rev_growth = 100.0  # new buyer in last 30d
+        else:
+            continue  # no recent activity
+
+        # Frequency growth (purchases per week)
+        freq_recent = recent[S.DATE].nunique() / 4.3
+        freq_prior  = prior[S.DATE].nunique() / 4.3 if not prior.empty else 0
+        freq_delta  = freq_recent - freq_prior
+
+        # Dept breadth
+        dept_recent = recent[S.DEPT].nunique() if S.DEPT in recent.columns else 0
+        dept_prior  = prior[S.DEPT].nunique() if S.DEPT in prior.columns and not prior.empty else 0
+        dept_delta  = dept_recent - dept_prior
+
+        # Composite score (weighted)
+        score = (
+            max(rev_growth, 0) * 0.5 +
+            max(freq_delta, 0) * 20 +
+            max(dept_delta, 0) * 10
+        )
+
+        # Low-base high-growth bonus (small total rev but strong % growth)
+        median_rev = df.groupby(cust_col)[S.REVENUE].sum().median()
+        if rev_total < median_rev * 0.5 and rev_growth > 30:
+            score *= 1.4
+
+        if score > 0:
+            records.append({
+                cust_col:      cust_id,
+                S.CUSTOMER:    cust_name,
+                S.REGION:      region,
+                S.CUST_GROUP:  segment,
+                "Rev_Total":   rev_total,
+                "Rev_Recent":  rev_recent,
+                "Rev_Growth":  round(rev_growth, 1),
+                "Freq_Recent": round(freq_recent, 2),
+                "Freq_Delta":  round(freq_delta, 2),
+                "Dept_Recent": dept_recent,
+                "Potential_Score": round(score, 1),
+            })
+
+    if not records:
+        return pd.DataFrame()
+    result = pd.DataFrame(records)
+    return result.sort_values("Potential_Score", ascending=False).head(n).reset_index(drop=True)
+
+
+# ── At-Risk Customer Detection ────────────────────────────────────────────────
+DEFAULT_RISK_THRESHOLDS = {
+    "L1_rev_drop":  15,   # % revenue drop → Level 1 (Yellow)
+    "L2_rev_drop":  35,   # % revenue drop → Level 2 (Orange)
+    "L3_rev_drop":  60,   # % revenue drop → Level 3 (Red)
+    "L1_gap_ratio": 1.5,  # last-purchase gap / normal cycle → L1
+    "L2_gap_ratio": 2.0,
+    "L3_gap_ratio": 3.0,
+    "no_buy_days":  60,   # auto Level 3 if not bought in N days
+}
+
+def identify_at_risk_customers(df: pd.DataFrame, thresholds: dict | None = None) -> pd.DataFrame:
+    """
+    3-level risk detection:
+      Red    (3): revenue drop ≥ L3 OR gap_ratio ≥ L3 OR no purchase ≥ no_buy_days
+      Orange (2): revenue drop ≥ L2 OR gap_ratio ≥ L2
+      Yellow (1): revenue drop ≥ L1 OR gap_ratio ≥ L1
+    Returns DataFrame sorted by alert_level desc, days_overdue desc.
+    """
+    t = {**DEFAULT_RISK_THRESHOLDS, **(thresholds or {})}
+    today    = df[S.DATE].max()
+    cut30    = today - pd.Timedelta(days=30)
+    cut60    = today - pd.Timedelta(days=60)
+    cust_col = S.CUST_NUM if S.CUST_NUM in df.columns else S.CUSTOMER
+
+    records = []
+    for cust_id, cdf in df.groupby(cust_col):
+        cust_name = cdf[S.CUSTOMER].iloc[0]
+        region    = cdf[S.REGION].iloc[0] if S.REGION in cdf.columns else ""
+        segment   = cdf[S.CUST_GROUP].iloc[0] if S.CUST_GROUP in cdf.columns else ""
+        last_buy  = cdf[S.DATE].max()
+        days_since = (today - last_buy).days
+
+        # Normal buying cycle (median gap between purchases)
+        dates = cdf[S.DATE].drop_duplicates().sort_values()
+        if len(dates) >= 2:
+            gaps = dates.diff().dt.days.dropna()
+            normal_cycle = gaps.median()
+        else:
+            normal_cycle = 30  # assume monthly
+
+        gap_ratio = days_since / max(normal_cycle, 1)
+
+        # Revenue comparison
+        rev_recent = cdf[cdf[S.DATE] >= cut30][S.REVENUE].sum()
+        rev_prior  = cdf[(cdf[S.DATE] >= cut60) & (cdf[S.DATE] < cut30)][S.REVENUE].sum()
+        rev_drop   = ((rev_prior - rev_recent) / rev_prior * 100) if rev_prior > 0 else 0
+        rev_drop   = max(rev_drop, 0)
+
+        # Determine alert level
+        level = 0
+        reasons = []
+        if days_since >= t["no_buy_days"] or rev_drop >= t["L3_rev_drop"] or gap_ratio >= t["L3_gap_ratio"]:
+            level = 3
+            if days_since >= t["no_buy_days"]: reasons.append(f"ไม่ซื้อ {days_since} วัน")
+            if rev_drop >= t["L3_rev_drop"]:   reasons.append(f"ยอดลด {rev_drop:.0f}%")
+        elif rev_drop >= t["L2_rev_drop"] or gap_ratio >= t["L2_gap_ratio"]:
+            level = 2
+            if gap_ratio >= t["L2_gap_ratio"]: reasons.append(f"ห่างหาย {gap_ratio:.1f}x รอบปกติ")
+            if rev_drop >= t["L2_rev_drop"]:   reasons.append(f"ยอดลด {rev_drop:.0f}%")
+        elif rev_drop >= t["L1_rev_drop"] or gap_ratio >= t["L1_gap_ratio"]:
+            level = 1
+            if gap_ratio >= t["L1_gap_ratio"]: reasons.append(f"ห่างหาย {gap_ratio:.1f}x รอบปกติ")
+            if rev_drop >= t["L1_rev_drop"]:   reasons.append(f"ยอดลด {rev_drop:.0f}%")
+
+        if level == 0:
+            continue
+
+        records.append({
+            cust_col:       cust_id,
+            S.CUSTOMER:     cust_name,
+            S.REGION:       region,
+            S.CUST_GROUP:   segment,
+            "Alert_Level":  level,
+            "Alert_Label":  {3: "🔴 Critical", 2: "🟠 Warning", 1: "🟡 Watch"}[level],
+            "Rev_Drop_Pct": round(rev_drop, 1),
+            "Days_Since":   days_since,
+            "Normal_Cycle": round(normal_cycle, 0),
+            "Gap_Ratio":    round(gap_ratio, 2),
+            "Rev_Recent":   rev_recent,
+            "Rev_Prior":    rev_prior,
+            "Last_Buy":     last_buy.strftime("%d %b %Y"),
+            "Risk_Reason":  ", ".join(reasons) if reasons else "trend ลดลง",
+        })
+
+    if not records:
+        return pd.DataFrame()
+    return (pd.DataFrame(records)
+            .sort_values(["Alert_Level", "Days_Since"], ascending=[False, False])
+            .reset_index(drop=True))
