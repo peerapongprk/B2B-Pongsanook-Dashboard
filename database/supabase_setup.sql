@@ -1,10 +1,10 @@
--- ════════════════════════════════════════════════════════════════════
---  SalesIQ — Supabase Setup Script
---  รันใน Supabase Dashboard → SQL Editor → New Query → Run
--- ════════════════════════════════════════════════════════════════════
+-- ════════════════════════════════════════════════════════════
+--  SalesIQ v6 — Supabase Setup
+--  รันใน SQL Editor → New Query → Run All
+-- ════════════════════════════════════════════════════════════
 
--- 1. Datasets metadata
-CREATE TABLE IF NOT EXISTS datasets (
+-- 1. Batch store (แทน datasets เดิม)
+CREATE TABLE IF NOT EXISTS data_batches (
     id           SERIAL PRIMARY KEY,
     label        TEXT    NOT NULL,
     filename     TEXT    NOT NULL,
@@ -12,7 +12,6 @@ CREATE TABLE IF NOT EXISTS datasets (
     col_count    INTEGER NOT NULL,
     date_min     TEXT,
     date_max     TEXT,
-    is_active    BOOLEAN DEFAULT FALSE,
     storage_path TEXT,
     uploaded_at  TIMESTAMPTZ DEFAULT NOW()
 );
@@ -32,32 +31,14 @@ CREATE TABLE IF NOT EXISTS visit_plan_override (
     is_deleted       INTEGER DEFAULT 0
 );
 
--- 3. Upload log
-CREATE TABLE IF NOT EXISTS upload_log (
-    id          SERIAL PRIMARY KEY,
-    filename    TEXT NOT NULL,
-    row_count   INTEGER NOT NULL,
-    uploaded_at TIMESTAMPTZ DEFAULT NOW()
-);
-
--- 4. Row Level Security (แนะนำ — ป้องกันการ query โดยไม่มี key)
-ALTER TABLE datasets             ENABLE ROW LEVEL SECURITY;
-ALTER TABLE visit_plan_override  ENABLE ROW LEVEL SECURITY;
-ALTER TABLE upload_log           ENABLE ROW LEVEL SECURITY;
-
--- อนุญาต service_role (ใช้ anon key ของ Streamlit)
-CREATE POLICY "allow_all_datasets"            ON datasets            FOR ALL USING (true) WITH CHECK (true);
-CREATE POLICY "allow_all_visit_override"      ON visit_plan_override FOR ALL USING (true) WITH CHECK (true);
-CREATE POLICY "allow_all_upload_log"          ON upload_log          FOR ALL USING (true) WITH CHECK (true);
-
--- 5. Users (salespeople)
+-- 3. Users (salespeople)
 CREATE TABLE IF NOT EXISTS users (
     id         SERIAL PRIMARY KEY,
     name       TEXT NOT NULL UNIQUE,
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- 6. User → Customer portfolio mapping
+-- 4. User portfolios
 CREATE TABLE IF NOT EXISTS user_customers (
     id            SERIAL PRIMARY KEY,
     user_id       INTEGER REFERENCES users(id) ON DELETE CASCADE,
@@ -67,7 +48,18 @@ CREATE TABLE IF NOT EXISTS user_customers (
     UNIQUE(user_id, customer_num)
 );
 
-ALTER TABLE users           ENABLE ROW LEVEL SECURITY;
-ALTER TABLE user_customers  ENABLE ROW LEVEL SECURITY;
-CREATE POLICY "allow_all_users"          ON users          FOR ALL USING (true) WITH CHECK (true);
-CREATE POLICY "allow_all_user_customers" ON user_customers FOR ALL USING (true) WITH CHECK (true);
+-- 5. RLS policies
+ALTER TABLE data_batches        ENABLE ROW LEVEL SECURITY;
+ALTER TABLE visit_plan_override ENABLE ROW LEVEL SECURITY;
+ALTER TABLE users               ENABLE ROW LEVEL SECURITY;
+ALTER TABLE user_customers      ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "open_data_batches"    ON data_batches        FOR ALL USING (true) WITH CHECK (true);
+CREATE POLICY "open_visit_override"  ON visit_plan_override FOR ALL USING (true) WITH CHECK (true);
+CREATE POLICY "open_users"           ON users               FOR ALL USING (true) WITH CHECK (true);
+CREATE POLICY "open_user_customers"  ON user_customers      FOR ALL USING (true) WITH CHECK (true);
+
+-- 6. Storage policy (salesiq bucket)
+CREATE POLICY "open_salesiq_storage"
+ON storage.objects FOR ALL TO anon, authenticated
+USING (bucket_id = 'salesiq') WITH CHECK (bucket_id = 'salesiq');
