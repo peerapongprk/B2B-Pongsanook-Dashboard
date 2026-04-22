@@ -1,4 +1,4 @@
-"""app.py — SalesIQ v5 · Page-based navigation"""
+"""app.py — SalesIQ v6 · Batch-based Master DB"""
 from __future__ import annotations
 import calendar
 from datetime import date, timedelta
@@ -6,7 +6,10 @@ import pandas as pd
 import streamlit as st
 
 from database.persistence import (
-    init_db, save_manual_visits, log_upload,
+    init_db, save_manual_visits,
+    save_batch, list_batches, load_batch, load_combined_df,
+    delete_batch, rename_batch, check_date_overlap,
+    # legacy aliases still work
     save_dataset, list_datasets, load_dataset,
     set_active_dataset, get_active_dataset_id,
     delete_dataset, rename_dataset,
@@ -65,7 +68,7 @@ _D = {
     "page":              "home",
     "prev_page":         "home",
     "df":                None,
-    "active_ds_id":      None,
+    "pending_upload":    None,   # {"label","filename","df","overlaps"} รอยืนยัน overlap
     "selected_user_id":  None,
     "selected_user":     None,
     "detail_cust_id":    None,
@@ -83,15 +86,25 @@ for k, v in _D.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
-# Auto-load active dataset
+# Auto-load Master DB (combined all batches)
 if st.session_state.df is None:
-    aid = get_active_dataset_id()
-    if aid:
-        try:
-            st.session_state.df = load_dataset(aid)
-            st.session_state.active_ds_id = aid
-        except Exception:
-            pass
+    try:
+        combined = load_combined_df()
+        if combined is not None:
+            st.session_state.df = combined
+    except Exception:
+        pass
+
+def _reload_master():
+    """Reload combined df from all batches and reset caches."""
+    try:
+        combined = load_combined_df()
+        st.session_state.df      = combined
+        st.session_state.pot_df  = None
+        st.session_state.risk_df = None
+        st.session_state.visit_plan = None
+    except Exception:
+        pass
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 def go(page: str):
@@ -686,67 +699,129 @@ if st.session_state.page == "my_page":
 #  PAGE: DATABASE
 # ═══════════════════════════════════════════════════════════════════════════════
 if st.session_state.page == "database":
-    st.markdown(section_header("ฐานข้อมูลกลาง", "🗄️"), unsafe_allow_html=True)
+    st.markdown(section_header("ฐานข้อมูลกลาง (Master DB)", "🗄️"), unsafe_allow_html=True)
 
-    # Upload
-    with st.expander("➕ เพิ่มชุดข้อมูลใหม่", expanded=(len(list_datasets())==0)):
-        new_label = st.text_input("ชื่อชุดข้อมูล", placeholder="เช่น Makro Q2 2026")
-        new_file  = st.file_uploader("Excel / CSV", type=["xlsx","xls","csv"],
-                                     label_visibility="collapsed", key="db_up")
+    # ── Master DB Summary ────────────────────────────────────────────────────
+    batches = list_batches()
+    if batches and st.session_state.df is not None:
+        mdf = st.session_state.df
+        total_rows  = len(mdf)
+        total_custs = mdf[S.CUST_NUM].nunique() if S.CUST_NUM in mdf.columns else mdf[S.CUSTOMER].nunique()
+        date_min    = batches[0].get("date_min","–")
+        date_max    = batches[-1].get("date_max","–")
+
+        st.markdown('<div class="chart-card" style="border-left:4px solid #1A56DB">', unsafe_allow_html=True)
+        sm1,sm2,sm3,sm4 = st.columns(4)
+        with sm1: st.markdown(kpi_card("Batch ทั้งหมด", str(len(batches)), "📦"), unsafe_allow_html=True)
+        with sm2: st.markdown(kpi_card("แถวข้อมูลรวม", f"{total_rows:,}", "🔢"), unsafe_allow_html=True)
+        with sm3: st.markdown(kpi_card("ลูกค้าทั้งหมด", f"{total_custs:,}", "🏪"), unsafe_allow_html=True)
+        with sm4: st.markdown(kpi_card("ช่วงข้อมูล", f"{date_min[:7]} → {date_max[:7]}", "📅"), unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+        # Timeline visual
+        st.markdown("<div style='margin:.75rem 0 .3rem;font-size:.82rem;font-weight:600;color:#374151'>📅 Timeline ของข้อมูลที่มีอยู่</div>", unsafe_allow_html=True)
+        timeline_html = '<div style="display:flex;gap:.3rem;flex-wrap:wrap;margin-bottom:.75rem">'
+        for b in batches:
+            dr = f"{b.get('date_min','')[:7]} → {b.get('date_max','')[:7]}" if b.get('date_min') else "ไม่ระบุ"
+            timeline_html += (f'<div style="background:#EBF1FF;border:1px solid #BFDBFE;border-radius:6px;'
+                              f'padding:.25rem .65rem;font-size:.75rem;color:#1A56DB">'
+                              f'<b>{b["label"]}</b> {dr}</div>')
+        timeline_html += '</div>'
+        st.markdown(timeline_html, unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    st.markdown("<div style='height:.5rem'></div>", unsafe_allow_html=True)
+
+    # ── Overlap warning / confirmation UI ────────────────────────────────────
+    if st.session_state.pending_upload is not None:
+        pu = st.session_state.pending_upload
+        st.warning(f"⚠️ ไฟล์ **{pu['filename']}** มีช่วงวันที่ทับซ้อนกับ batch ที่มีอยู่แล้ว:")
+        for ov in pu["overlaps"]:
+            st.markdown(f"- **{ov['label']}** ({ov.get('date_min','')[:7]} → {ov.get('date_max','')[:7]}) — {ov['row_count']:,} แถว")
+        st.markdown("ถ้ายืนยัน ระบบจะ **ลบ batch เดิมที่ทับซ้อน** แล้วใส่ batch ใหม่แทน")
+        cc1,cc2 = st.columns(2)
+        with cc1:
+            if st.button("✅ ยืนยัน Replace", type="primary", use_container_width=True, key="confirm_replace"):
+                with st.spinner("กำลัง replace…"):
+                    for ov in pu["overlaps"]:
+                        delete_batch(ov["id"])
+                    save_batch(pu["label"], pu["filename"], pu["df"])
+                    st.session_state.pending_upload = None
+                    _reload_master()
+                st.success("✅ Replace สำเร็จ — Master DB อัปเดตแล้ว")
+                st.rerun()
+        with cc2:
+            if st.button("✖️ ยกเลิก", use_container_width=True, key="cancel_replace"):
+                st.session_state.pending_upload = None
+                st.rerun()
+        st.divider()
+
+    # ── Upload new batch ─────────────────────────────────────────────────────
+    with st.expander("➕ เพิ่ม Batch ใหม่เข้า Master DB", expanded=(len(batches)==0)):
+        ul1,ul2 = st.columns([3,1])
+        with ul1:
+            new_label = st.text_input("ชื่อ Batch", placeholder="เช่น ม.ค. 2026, มี.ค. 2026, Q1 2026")
+        new_file = st.file_uploader("Excel (.xlsx) หรือ CSV",
+                                    type=["xlsx","xls","csv"],
+                                    label_visibility="collapsed", key="db_up")
         if new_file:
             auto_label = new_label.strip() or new_file.name.rsplit(".",1)[0]
-            if st.button("💾 บันทึก", type="primary", use_container_width=True):
-                with st.spinner("กำลังบันทึก…"):
-                    raw = load_raw_file(new_file)
+            if st.button("🔍 ตรวจสอบและบันทึก", type="primary", use_container_width=True, key="db_save"):
+                with st.spinner("กำลังประมวลผล…"):
+                    raw       = load_raw_file(new_file)
                     df_new, warns = clean_data(raw)
-                    save_dataset(auto_label, new_file.name, df_new)
                     for w in warns: st.warning(w)
-                    st.success(f"✅ บันทึก {auto_label} — {len(df_new):,} แถว")
+                    date_min, date_max = (str(df_new["Date"].min().date()), str(df_new["Date"].max().date())) if "Date" in df_new.columns else (None, None)
+                    overlaps  = check_date_overlap(date_min, date_max) if date_min else []
+
+                if overlaps:
+                    st.session_state.pending_upload = {
+                        "label": auto_label, "filename": new_file.name,
+                        "df": df_new, "overlaps": overlaps,
+                    }
+                    st.rerun()
+                else:
+                    with st.spinner("กำลังบันทึก…"):
+                        save_batch(auto_label, new_file.name, df_new)
+                        _reload_master()
+                    st.success(f"✅ เพิ่ม **{auto_label}** สำเร็จ — {len(df_new):,} แถว | Master DB อัปเดตแล้ว")
                     st.rerun()
 
-    datasets  = list_datasets()
-    active_id = get_active_dataset_id()
+    st.markdown("<div style='height:.5rem'></div>", unsafe_allow_html=True)
 
-    if not datasets:
-        st.info("ยังไม่มีชุดข้อมูล")
+    # ── Batch list ───────────────────────────────────────────────────────────
+    batches = list_batches()
+    if not batches:
+        st.info("ยังไม่มี Batch — อัปโหลดไฟล์ด้านบนเพื่อเริ่มต้นครับ")
     else:
-        st.markdown(f"**{len(datasets)} ชุดข้อมูล**")
-        for ds in datasets:
-            is_active = ds["id"] == active_id
-            border = "2px solid #1A56DB" if is_active else "1px solid #E2E8F0"
-            bg     = "#F0F7FF" if is_active else "#FFFFFF"
-            st.markdown(f'<div style="background:{bg};border:{border};border-radius:12px;padding:.9rem 1.1rem;margin-bottom:.5rem">', unsafe_allow_html=True)
-            rl,rr = st.columns([5,3])
-            with rl:
-                st.markdown(f"**{ds['label']}**{'  🟢 ใช้งานอยู่' if is_active else ''}")
-                dr = f"{ds['date_min']} → {ds['date_max']}" if ds.get('date_min') else "ไม่ระบุช่วงวัน"
-                st.caption(f"📁 {ds['filename']} | 🔢 {ds['row_count']:,} แถว | 📅 {dr} | ⏱ {ds['uploaded_at'][:16]}")
-            with rr:
-                b1,b2,b3 = st.columns(3)
-                with b1:
-                    if not is_active:
-                        if st.button("✅ ใช้งาน", key=f"act_{ds['id']}", use_container_width=True):
-                            set_active_dataset(ds["id"])
-                            st.session_state.df             = load_dataset(ds["id"])
-                            st.session_state.active_ds_id   = ds["id"]
-                            st.session_state.visit_plan     = None
-                            st.session_state.pot_df         = None
-                            st.session_state.risk_df        = None
+        st.markdown(f"**{len(batches)} Batch** ใน Master DB (เรียงตามวันที่เก่า → ใหม่)")
+        for b in batches:
+            dr = f"{b.get('date_min','')[:10]} → {b.get('date_max','')[:10]}" if b.get("date_min") else "ไม่ระบุช่วงวัน"
+            st.markdown('<div class="chart-card" style="padding:.8rem 1.1rem;margin-bottom:.4rem">', unsafe_allow_html=True)
+            bl,br = st.columns([5,3])
+            with bl:
+                st.markdown(f"📦 **{b['label']}**")
+                st.caption(f"📁 {b['filename']}  |  🔢 {b['row_count']:,} แถว  |  📅 {dr}  |  ⏱ {b['uploaded_at'][:16]}")
+            with br:
+                bc1,bc2 = st.columns(2)
+                with bc1:
+                    with st.popover("✏️ เปลี่ยนชื่อ"):
+                        nn = st.text_input("ชื่อใหม่", value=b["label"], key=f"ren_{b['id']}")
+                        if st.button("บันทึก", key=f"rs_{b['id']}"):
+                            rename_batch(b["id"], nn); st.rerun()
+                with bc2:
+                    with st.popover("🗑️ ลบ Batch นี้"):
+                        st.markdown(f"ลบ **{b['label']}** ออกจาก Master DB?")
+                        st.caption("ข้อมูลในช่วงนี้จะหายไปจาก Master DB ทั้งหมด")
+                        if st.button("ยืนยันลบ", key=f"del_{b['id']}", type="primary"):
+                            with st.spinner("กำลังลบและอัปเดต Master DB…"):
+                                delete_batch(b["id"])
+                                _reload_master()
+                            st.success(f"✅ ลบ {b['label']} แล้ว — Master DB อัปเดต")
                             st.rerun()
-                with b2:
-                    with st.popover("✏️"):
-                        nn = st.text_input("ชื่อใหม่", value=ds["label"], key=f"ren_{ds['id']}")
-                        if st.button("บันทึก", key=f"rs_{ds['id']}"):
-                            rename_dataset(ds["id"], nn); st.rerun()
-                with b3:
-                    if not is_active:
-                        with st.popover("🗑️"):
-                            st.markdown(f"ลบ **{ds['label']}** ?")
-                            if st.button("ยืนยัน", key=f"del_{ds['id']}", type="primary"):
-                                delete_dataset(ds["id"]); st.rerun()
             st.markdown('</div>', unsafe_allow_html=True)
 
-    # User management
+    # ── User / Salesperson management ────────────────────────────────────────
     st.markdown("<div style='height:1rem'></div>", unsafe_allow_html=True)
     st.markdown(section_header("จัดการชื่อเซลล์", "👤"), unsafe_allow_html=True)
     with st.expander("➕ เพิ่มเซลล์ใหม่"):
