@@ -131,7 +131,8 @@ def df_for_user() -> pd.DataFrame:
     if not custs:
         return df.iloc[0:0]  # empty same schema
     col = S.CUST_NUM if S.CUST_NUM in df.columns else S.CUSTOMER
-    return df[df[col].isin(custs)]
+    custs_str = [str(c) for c in custs]
+    return df[df[col].astype(str).isin(custs_str)]
 
 # ── Top Navigation ─────────────────────────────────────────────────────────────
 def render_nav():
