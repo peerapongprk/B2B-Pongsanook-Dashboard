@@ -332,12 +332,15 @@ def get_user_customers(user_id: int) -> list[str]:
 
 def set_user_customers(user_id: int, customer_nums: list[str], customer_names: dict | None = None) -> None:
     names = customer_names or {}
+    customer_nums = [str(c) for c in customer_nums]  # always string
     if _use_supabase():
         sb = _sb()
         sb.table("user_customers").delete().eq("user_id", user_id).execute()
         if customer_nums:
             sb.table("user_customers").insert(
-                [{"user_id": user_id, "customer_num": c, "customer_name": names.get(c,"")} for c in customer_nums]
+                [{"user_id": user_id, "customer_num": c,
+                  "customer_name": names.get(c, names.get(int(c) if c.isdigit() else c, ""))}
+                 for c in customer_nums]
             ).execute()
         return
     _ensure_user_tables_sqlite()
